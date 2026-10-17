@@ -168,14 +168,10 @@ export function deriveLabel(command: string, expression: string): string {
   let script: string | null = null;
   for (const tok of tokens) {
     if (tok.startsWith('-')) continue; // skip flags
-    if (/^(python|python3|node|bash|sh|ruby|perl|java|php|deno|bun)$/i.test(tok)) continue; // skip interpreters
-    if (!script && /\.[a-z]+$/i.test(tok)) {
-      script = tok; // first file with extension
-      break;
-    }
-    if (!script) {
-      script = tok; // first non-flag, non-interpreter token
-    }
+    const base = tok.replace(/^.*\//, '');
+    if (/^(python|python3|node|bash|sh|ruby|perl|java|php|deno|bun)$/i.test(base)) continue; // skip interpreters (incl. paths)
+    script = tok;
+    break;
   }
   const base = script || tokens[tokens.length - 1] || command;
   return base.replace(/^.*\//, '');
