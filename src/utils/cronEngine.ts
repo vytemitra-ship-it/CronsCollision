@@ -1,6 +1,14 @@
 // Cron Engine — zero-dependency parser, collision detector, and auto-balance optimizer.
 // Supports standard 5-part cron syntax plus macros, wildcards, steps, ranges, and lists.
 
+export type ResourceWeight = 'light' | 'medium' | 'heavy';
+
+export const WEIGHT_CPU: Record<ResourceWeight, number> = {
+  light: 15,
+  medium: 35,
+  heavy: 65,
+};
+
 export interface CronJob {
   id: string;
   raw: string;
@@ -15,6 +23,7 @@ export interface CronJob {
   dow: number[]; // allowed days of week 0-6 (0=Sun)
   error?: string;
   dailyRuns: number;
+  weight: ResourceWeight;
 }
 
 export interface ParsedCrontab {
@@ -139,6 +148,14 @@ function parseDurationFromComment(comment: string): number {
   return 1;
 }
 
+function parseWeightFromComment(comment: string, duration: number): ResourceWeight {
+  const match = comment.match(/weight:\s*(light|medium|heavy)/i);
+  if (match) return match[1].toLowerCase() as ResourceWeight;
+  if (duration >= 8) return 'heavy';
+  if (duration >= 4) return 'medium';
+  return 'light';
+}
+
 function deriveLabel(command: string, expression: string): string {
   if (!command) {
     return expression;
@@ -221,6 +238,7 @@ export function parseCrontab(text: string): ParsedCrontab {
     const dailyRuns = minuteArr.length * hourArr.length;
 
     const duration = parseDurationFromComment(comment);
+    const weight = parseWeightFromComment(comment, duration);
 
     jobs.push({
       id: nextId(),
@@ -235,6 +253,7 @@ export function parseCrontab(text: string): ParsedCrontab {
       month: monthArr,
       dow: dowArr,
       dailyRuns,
+      weight,
     });
   });
 
@@ -553,4 +572,102 @@ export function jobsToJsonReport(jobs: CronJob[], stats: CollisionStats): string
 
 function sanitizeYamlKey(name: string): string {
   return name.replace(/[^a-zA-Z0-9_-]/g, '-').replace(/^-+|-+$/g, '') || 'job';
+}
+
+// ---------- CPU Load Simulation ----------
+
+export interface CpuStats {
+  cpuByMinute: number[]; // 0-100+ percent
+  peakCpu: number;
+  peakCpuMinute: number;
+  overloadMinutes: number; // minutes where CPU > 100
+  overloadPct: number;
+}
+
+export function computeCpuStats(jobs: CronJob[]): CpuStats {
+  const cpu = new Array(1440).fill(0);
+
+  for (const job of jobs) {
+    if (job.error) continue;
+    const cpuCost = WEIGHT_CPU[job.weight];
+    for (const h of job.hour) {
+      for (const m of job.minute) {
+        const start = h * 60 + m;
+        for (let d = 0; d < job.durationMin; d++) {
+          const idx = (start + d) % 1440;
+          cpu[idx] += cpuCost;
+        }
+      }
+    }
+  }
+
+  let peakCpu = 0;
+  let peakCpuMinute = 0;
+  let overloadMinutes = 0;
+  for (let i = 0; i < 1440; i++) {
+    if (cpu[i] > peakCpu) {
+      peakCpu = cpu[i];
+      peakCpuMinute = i;
+    }
+    if (cpu[i] > 100) overloadMinutes++;
+  }
+
+  return {
+    cpuByMinute: cpu,
+    peakCpu,
+    peakCpuMinute,
+    overloadMinutes,
+    overloadPct: (overloadMinutes / 1440) * 100,
+  };
+}
+
+// ---------- Job Nudge (time offset shift) ----------
+
+// Shifts a job's schedule by deltaMinutes while preserving its frequency.
+// For hourly jobs (* * * * * with single minute): shifts the minute, wrapping 0-59.
+// For daily jobs (single hour + single minute): shifts across hour boundary.
+// For stepped jobs (*/N): shifts the base offset within the step.
+export function nudgeJob(job: CronJob, deltaMinutes: number): CronJob {
+  const newMinute = [...job.minute];
+  const newHour = [...job.hour];
+
+  if (job.hour.length === 24) {
+    // hourly or sub-hourly — shift minute base
+    if (newMinute.length === 1) {
+      newMinute[0] = ((newMinute[0] + deltaMinutes) % 60 + 60) % 60;
+    } else {
+      // stepped: shift base
+      const step = newMinute[1] - newMinute[0];
+      const newBase = ((newMinute[0] + deltaMinutes) % step + step) % step;
+      for (let i = 0; i < newMinute.length; i++) {
+        newMinute[i] = (newBase + i * step) % 60;
+      }
+    }
+  } else if (job.hour.length === 1 && newMinute.length === 1) {
+    // daily — shift across hour:minute boundary
+    const totalMin = job.hour[0] * 60 + newMinute[0] + deltaMinutes;
+    const wrapped = ((totalMin % 1440) + 1440) % 1440;
+    newHour[0] = Math.floor(wrapped / 60) % 24;
+    newMinute[0] = wrapped % 60;
+  } else if (newMinute.length > 1) {
+    // stepped minute with restricted hours
+    const step = newMinute[1] - newMinute[0];
+    const newBase = ((newMinute[0] + deltaMinutes) % step + step) % step;
+    for (let i = 0; i < newMinute.length; i++) {
+      newMinute[i] = (newBase + i * step) % 60;
+    }
+  }
+
+  const expression = rebuildExpression({
+    ...job,
+    minute: newMinute,
+    hour: newHour,
+  });
+
+  return {
+    ...job,
+    minute: newMinute,
+    hour: newHour,
+    expression,
+  };
 }

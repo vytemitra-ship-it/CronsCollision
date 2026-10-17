@@ -8,8 +8,8 @@ import DiffModal from '@/components/DiffModal';
 import ExportModal from '@/components/ExportModal';
 import { PRESETS, DEFAULT_PRESET_INDEX } from '@/utils/presets';
 import {
-  parseCrontab, computeCollisionStats, autoBalance, jobsToCrontab,
-  type CronJob, type BalancedResult,
+  parseCrontab, computeCollisionStats, computeCpuStats, autoBalance, jobsToCrontab, nudgeJob,
+  type CronJob, type BalancedResult, type ResourceWeight,
 } from '@/utils/cronEngine';
 import { encodeCrontabToHash, getCrontabFromUrl } from '@/utils/share';
 
@@ -26,6 +26,7 @@ function App() {
 
   const parsed = useMemo(() => parseCrontab(crontabText), [crontabText]);
   const stats = useMemo(() => computeCollisionStats(parsed.jobs), [parsed.jobs]);
+  const cpuStats = useMemo(() => computeCpuStats(parsed.jobs), [parsed.jobs]);
 
   const loadPreset = (i: number) => {
     setPresetIndex(i);
@@ -36,23 +37,55 @@ function App() {
     }
   };
 
-  const handleDurationChange = useCallback((jobId: string, duration: number) => {
+  const updateLineForJob = useCallback((jobId: string, lineUpdater: (codePart: string, comment: string) => string) => {
     setCrontabText((prev) => {
       const lines = prev.split('\n');
-      const job = parsed.jobs.find((j) => j.id === jobId);
+      const job = parseCrontab(prev).jobs.find((j) => j.id === jobId);
       if (!job) return prev;
       const lineIdx = lines.findIndex((l) => l.trim() === job.raw || (l.includes(job.command) && l.includes(job.expression)));
       if (lineIdx < 0) return prev;
       const line = lines[lineIdx];
       const hashIdx = line.indexOf('#');
-      const codePart = hashIdx >= 0 ? line.slice(0, hashIdx) : line;
+      const codePart = hashIdx >= 0 ? line.slice(0, hashIdx).trim() : line.trim();
       const comment = hashIdx >= 0 ? line.slice(hashIdx + 1) : '';
-      const newComment = comment.replace(/duration:\s*\d+\s*m?/i, `duration:${duration}m`);
-      const finalComment = /duration:/i.test(newComment) ? newComment : `${newComment} duration:${duration}m`;
-      lines[lineIdx] = `${codePart} # ${finalComment}`;
+      lines[lineIdx] = lineUpdater(codePart, comment);
       return lines.join('\n');
     });
-  }, [parsed.jobs]);
+  }, []);
+
+  const handleDurationChange = useCallback((jobId: string, duration: number) => {
+    updateLineForJob(jobId, (codePart, comment) => {
+      const newComment = comment.replace(/duration:\s*\d+\s*m?/i, `duration:${duration}m`);
+      const finalComment = /duration:/i.test(newComment) ? newComment : `${newComment} duration:${duration}m`;
+      return `${codePart} # ${finalComment}`;
+    });
+  }, [updateLineForJob]);
+
+  const handleWeightChange = useCallback((jobId: string, weight: ResourceWeight) => {
+    updateLineForJob(jobId, (codePart, comment) => {
+      const deWeighted = comment.replace(/weight:\s*\w+/i, '').trim();
+      const deDuration = deWeighted.replace(/duration:\s*\d+\s*m?/i, '').trim();
+      const durMatch = comment.match(/duration:\s*(\d+)\s*m?/i);
+      const dur = durMatch ? `duration:${durMatch[1]}m ` : '';
+      return `${codePart} # ${dur}weight:${weight}`;
+    });
+  }, [updateLineForJob]);
+
+  const handleNudge = useCallback((jobId: string, deltaMinutes: number) => {
+    setCrontabText((prev) => {
+      const parsedPrev = parseCrontab(prev);
+      const job = parsedPrev.jobs.find((j) => j.id === jobId);
+      if (!job) return prev;
+      const nudged = nudgeJob(job, deltaMinutes);
+      const lines = prev.split('\n');
+      const lineIdx = lines.findIndex((l) => l.trim() === job.raw || (l.includes(job.command) && l.includes(job.expression)));
+      if (lineIdx < 0) return prev;
+      const hashIdx = lines[lineIdx].indexOf('#');
+      const comment = hashIdx >= 0 ? ` # ${lines[lineIdx].slice(hashIdx + 1).trim()}` : '';
+      lines[lineIdx] = `${nudged.expression} ${job.command || '/usr/bin/run.sh'}${comment}`;
+      return lines.join('\n');
+    });
+  }, []);
 
   const handleAutoBalance = () => {
     const result = autoBalance(parsed.jobs);
@@ -85,6 +118,17 @@ function App() {
     return () => window.removeEventListener('hashchange', onHashChange);
   }, []);
 
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => {
+      if ((e.altKey || e.metaKey) && e.key.toLowerCase() === 'b') {
+        e.preventDefault();
+        handleAutoBalance();
+      }
+    };
+    window.addEventListener('keydown', onKey);
+    return () => window.removeEventListener('keydown', onKey);
+  });
+
   return (
     <div className="min-h-screen bg-slate-950 text-slate-100">
       {/* ambient gradient */}
@@ -107,7 +151,7 @@ function App() {
 
         <main className="max-w-[1600px] mx-auto px-4 sm:px-6 py-5 space-y-5">
           <KpiBar stats={stats} jobCount={parsed.jobs.length} />
-          <Heatmap stats={stats} jobs={parsed.jobs} />
+          <Heatmap stats={stats} cpuStats={cpuStats} jobs={parsed.jobs} />
 
           <div className="grid grid-cols-1 lg:grid-cols-2 gap-5 min-h-[420px]">
             <CrontabEditor
@@ -120,11 +164,14 @@ function App() {
               jobs={parsed.jobs}
               stats={stats}
               onDurationChange={handleDurationChange}
+              onWeightChange={handleWeightChange}
+              onNudge={handleNudge}
             />
           </div>
 
           <footer className="text-center text-xs text-slate-600 py-4">
-            CronsCollision — 100% client-side cron overlap visualizer. No data leaves your browser.
+            CronsCollision — 100% client-side cron overlap visualizer. No data leaves your browser.{' '}
+            <span className="text-slate-500">Press <kbd className="px-1 py-0.5 rounded bg-slate-800 border border-slate-700 text-[10px] font-mono">Alt+B</kbd> to auto-balance.</span>
           </footer>
         </main>
       </div>
