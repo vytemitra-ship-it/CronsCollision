@@ -149,11 +149,11 @@ function App() {
           shared={shared}
         />
 
-        <main className="max-w-[1600px] mx-auto px-4 sm:px-6 py-5 space-y-5">
+        <main className="max-w-[1600px] mx-auto px-4 sm:px-6 py-4 space-y-4">
           <KpiBar stats={stats} jobCount={parsed.jobs.length} />
           <Heatmap stats={stats} cpuStats={cpuStats} jobs={parsed.jobs} />
 
-          <div className="grid grid-cols-1 lg:grid-cols-2 gap-5 min-h-[420px]">
+          <div className="grid grid-cols-1 lg:grid-cols-2 gap-4 h-[460px]">
             <CrontabEditor
               text={crontabText}
               onChange={setCrontabText}
@@ -169,7 +169,7 @@ function App() {
             />
           </div>
 
-          <footer className="text-center text-xs text-slate-600 py-4">
+          <footer className="text-center text-xs text-slate-600 py-2">
             CronsCollision — 100% client-side cron overlap visualizer. No data leaves your browser.{' '}
             <span className="text-slate-500">Press <kbd className="px-1 py-0.5 rounded bg-slate-800 border border-slate-700 text-[10px] font-mono">Alt+B</kbd> to auto-balance.</span>
           </footer>
