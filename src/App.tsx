@@ -9,7 +9,7 @@ import ExportModal from '@/components/ExportModal';
 import { PRESETS, DEFAULT_PRESET_INDEX } from '@/utils/presets';
 import {
   parseCrontab, computeCollisionStats, computeCpuStats, autoBalance, jobsToCrontab, nudgeJob,
-  type CronJob, type BalancedResult, type ResourceWeight,
+  type BalancedResult, type ResourceWeight,
 } from '@/utils/cronEngine';
 import { encodeCrontabToHash, getCrontabFromUrl } from '@/utils/share';
 
@@ -55,19 +55,25 @@ function App() {
 
   const handleDurationChange = useCallback((jobId: string, duration: number) => {
     updateLineForJob(jobId, (codePart, comment) => {
-      const newComment = comment.replace(/duration:\s*\d+\s*m?/i, `duration:${duration}m`);
-      const finalComment = /duration:/i.test(newComment) ? newComment : `${newComment} duration:${duration}m`;
-      return `${codePart} # ${finalComment}`;
+      // Remove existing duration, keep remaining comment text
+      const cleaned = comment.replace(/duration:\s*\d+\s*m?/gi, '').replace(/\s+/g, ' ').trim();
+      const newComment = cleaned ? `${cleaned} duration:${duration}m` : `duration:${duration}m`;
+      return `${codePart} # ${newComment}`;
     });
   }, [updateLineForJob]);
 
   const handleWeightChange = useCallback((jobId: string, weight: ResourceWeight) => {
     updateLineForJob(jobId, (codePart, comment) => {
-      const deWeighted = comment.replace(/weight:\s*\w+/i, '').trim();
-      const deDuration = deWeighted.replace(/duration:\s*\d+\s*m?/i, '').trim();
+      // Remove existing weight and duration, then re-append cleanly
+      const cleaned = comment
+        .replace(/weight:\s*\w+/gi, '')
+        .replace(/duration:\s*\d+\s*m?/gi, '')
+        .replace(/\s+/g, ' ')
+        .trim();
       const durMatch = comment.match(/duration:\s*(\d+)\s*m?/i);
       const dur = durMatch ? `duration:${durMatch[1]}m ` : '';
-      return `${codePart} # ${dur}weight:${weight}`;
+      const newComment = cleaned ? `${cleaned} ${dur}weight:${weight}` : `${dur}weight:${weight}`;
+      return `${codePart} # ${newComment.replace(/\s+/g, ' ').trim()}`;
     });
   }, [updateLineForJob]);
 

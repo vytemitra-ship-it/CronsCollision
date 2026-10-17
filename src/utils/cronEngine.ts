@@ -41,7 +41,7 @@ export interface CollisionStats {
   loadByMinute: number[]; // length 1440
   peakLoad: number;
   peakMinute: number;
-  collisionMinutes: number; // minutes where load >= 3
+  collisionMinutes: number; // minutes where load >= 2
   collisionPct: number;
   jobsAtPeak: { id: string; label: string }[];
   inspections: MinuteInspection[];
@@ -106,6 +106,8 @@ function parseField(
       if (ra == null || rb == null) return { error: `${fieldName}: invalid range "${rangePart}"` };
       start = ra;
       end = rb;
+      if (start < min || start > max) return { error: `${fieldName}: value ${start} out of range [${min}-${max}]` };
+      if (end < min || end > max) return { error: `${fieldName}: value ${end} out of range [${min}-${max}]` };
       if (start > end) {
         // wrap-around range (e.g. 22-2 for hours)
         for (let v = start; v <= max; v += step) result.add(v);
@@ -156,12 +158,27 @@ function parseWeightFromComment(comment: string, duration: number): ResourceWeig
   return 'light';
 }
 
-function deriveLabel(command: string, expression: string): string {
+export function deriveLabel(command: string, expression: string): string {
   if (!command) {
     return expression;
   }
-  const base = command.split(/\s+/).pop() || command;
-  return base.replace(/^\//, '');
+  // Find the script/executable: skip interpreter prefixes (python3, node, bash, etc.)
+  // and ignore CLI flags (--flag, -f) and their values.
+  const tokens = command.split(/\s+/);
+  let script: string | null = null;
+  for (const tok of tokens) {
+    if (tok.startsWith('-')) continue; // skip flags
+    if (/^(python|python3|node|bash|sh|ruby|perl|java|php|deno|bun)$/i.test(tok)) continue; // skip interpreters
+    if (!script && /\.[a-z]+$/i.test(tok)) {
+      script = tok; // first file with extension
+      break;
+    }
+    if (!script) {
+      script = tok; // first non-flag, non-interpreter token
+    }
+  }
+  const base = script || tokens[tokens.length - 1] || command;
+  return base.replace(/^.*\//, '');
 }
 
 export function parseCrontab(text: string): ParsedCrontab {
@@ -216,22 +233,21 @@ export function parseCrontab(text: string): ParsedCrontab {
     const hour = parseField(fields[1], 0, 23, undefined, 'hour');
     const dom = parseField(fields[2], 1, 31, undefined, 'dom');
     const month = parseField(fields[3], 1, 12, MONTH_NAMES, 'month');
-    const dow = parseField(fields[4], 0, 6, DOW_NAMES, 'dow');
+    const dowRaw = parseField(fields[4], 0, 7, DOW_NAMES, 'dow');
 
-    for (const r of [minute, hour, dom, month, dow]) {
+    for (const r of [minute, hour, dom, month, dowRaw]) {
       if (r instanceof Object && 'error' in r) {
         errors.push({ line: idx + 1, raw: line, message: r.error });
         return;
       }
     }
 
-    // For daily analysis we assume every day fires (dom/month/dow all match "every day").
-    // We treat dom/month/dow as full ranges unless restricted; restricted values reduce dailyRuns estimate.
     const minuteArr = minute as number[];
     const hourArr = hour as number[];
     const domArr = dom as number[];
     const monthArr = month as number[];
-    const dowArr = dow as number[];
+    // Map DOW 7 (Sunday in POSIX) to 0
+    const dowArr = (dowRaw as number[]).map((d) => (d === 7 ? 0 : d));
 
     // Approximate daily runs: if dow/dom are unrestricted, count minute*hour combos.
     // If dow restricted, still show per-day runs as combos (we visualize a single representative day).
@@ -290,7 +306,7 @@ export function computeCollisionStats(jobs: CronJob[]): CollisionStats {
 
   let collisionMinutes = 0;
   for (let i = 0; i < 1440; i++) {
-    if (load[i] >= 3) collisionMinutes++;
+    if (load[i] >= 2) collisionMinutes++;
   }
 
   const peakJobIds = [...new Set(jobsByMinute[peakMinute])];
@@ -386,30 +402,55 @@ export function autoBalance(jobs: CronJob[]): BalancedResult {
   // Deep clone
   const optimized = jobs.map((j) => ({ ...j, minute: [...j.minute], hour: [...j.hour] }));
 
-  // Strategy: sort jobs by peak contribution. For each job, try shifting its base offset
-  // to a minute/hour that minimizes total collision load, while preserving its frequency shape.
-  // Frequency preservation: keep the same set sizes and step pattern, only change the base offset.
+  // Strategy: For each job, precompute a background load array from all OTHER jobs,
+  // then score each candidate offset incrementally in O(duration) per candidate.
+  // This avoids the O(N^2 * 1440^2) blowup from recomputing computeCollisionStats on every iteration.
 
   for (const job of optimized) {
     if (job.error) continue;
     const originalMinute = [...job.minute];
     const originalHour = [...job.hour];
 
-    let bestScore = scoreJobOverlap(job, optimized);
+    // Precompute background load from all other jobs
+    const otherLoad = new Array(1440).fill(0);
+    for (const other of optimized) {
+      if (other.id === job.id || other.error) continue;
+      for (const h of other.hour) {
+        for (const m of other.minute) {
+          const start = h * 60 + m;
+          for (let d = 0; d < other.durationMin; d++) {
+            otherLoad[(start + d) % 1440] += 1;
+          }
+        }
+      }
+    }
+
+    // Score a candidate offset incrementally against the precomputed background load
+    const scoreCandidate = (mins: number[], hrs: number[]): number => {
+      let score = 0;
+      for (const h of hrs) {
+        for (const m of mins) {
+          const start = h * 60 + m;
+          for (let d = 0; d < job.durationMin; d++) {
+            const idx = (start + d) % 1440;
+            const total = otherLoad[idx] + 1;
+            score += total * total;
+          }
+        }
+      }
+      return score;
+    };
+
+    let bestScore = scoreCandidate(originalMinute, originalHour);
     let bestMinute = [...originalMinute];
     let bestHour = [...originalHour];
-
-    // For hourly jobs (hour=24, single minute): shift the minute 0-59.
-    // For daily jobs (single hour, single minute): try all hour*minute combos (1440) — pick lowest.
-    // For stepped-minute jobs (*/N): shift base offset within the step.
 
     if (job.hour.length === 24) {
       // hourly or frequent — shift minute base
       const step = originalMinute.length > 1 ? originalMinute[1] - originalMinute[0] : 60;
       for (let base = 0; base < step; base++) {
         const shifted = buildSteppedRange(base, step, 60);
-        job.minute = shifted;
-        const s = scoreJobOverlap(job, optimized);
+        const s = scoreCandidate(shifted, originalHour);
         if (s < bestScore) {
           bestScore = s;
           bestMinute = shifted;
@@ -417,12 +458,10 @@ export function autoBalance(jobs: CronJob[]): BalancedResult {
       }
       job.minute = bestMinute;
     } else if (job.hour.length === 1 && job.minute.length === 1) {
-      // daily — try hour shifts primarily (minute stays or also shifts)
+      // daily — try all hour*minute combos (1440) — pick lowest
       for (let h = 0; h < 24; h++) {
         for (let m = 0; m < 60; m++) {
-          job.hour = [h];
-          job.minute = [m];
-          const s = scoreJobOverlap(job, optimized);
+          const s = scoreCandidate([m], [h]);
           if (s < bestScore) {
             bestScore = s;
             bestHour = [h];
@@ -437,8 +476,7 @@ export function autoBalance(jobs: CronJob[]): BalancedResult {
       const step = originalMinute[1] - originalMinute[0];
       for (let base = 0; base < step; base++) {
         const shifted = buildSteppedRange(base, step, 60);
-        job.minute = shifted;
-        const s = scoreJobOverlap(job, optimized);
+        const s = scoreCandidate(shifted, originalHour);
         if (s < bestScore) {
           bestScore = s;
           bestMinute = shifted;
@@ -470,36 +508,22 @@ function buildSteppedRange(base: number, step: number, max: number): number[] {
   return out;
 }
 
-// Score: sum of (load^2) over minutes this job is active — penalizes collisions heavily.
-function scoreJobOverlap(job: CronJob, all: CronJob[]): number {
-  const tempStats = computeCollisionStats(all);
-  let score = 0;
-  for (const h of job.hour) {
-    for (const m of job.minute) {
-      const start = h * 60 + m;
-      for (let d = 0; d < job.durationMin; d++) {
-        const idx = (start + d) % 1440;
-        score += tempStats.loadByMinute[idx] * tempStats.loadByMinute[idx];
-      }
-    }
-  }
-  return score;
-}
-
 function rebuildExpression(job: CronJob): string {
-  const m = formatField(job.minute, 60, 0);
-  const h = formatField(job.hour, 24, 0);
+  const m = formatField(job.minute, 60);
+  const h = formatField(job.hour, 24);
   return `${m} ${h} ${job.dom.length === 31 ? '*' : job.dom.join(',')} ${
     job.month.length === 12 ? '*' : job.month.join(',')
   } ${job.dow.length === 7 ? '*' : job.dow.join(',')}`;
 }
 
-function formatField(vals: number[], mod: number, min: number): string {
+function formatField(vals: number[], mod: number): string {
   if (vals.length === mod) return '*';
   if (vals.length > 2) {
     const step = vals[1] - vals[0];
     if (step > 1 && vals.every((v, i) => i === 0 || v - vals[i - 1] === step)) {
-      return `${vals[0]}/${step}`;
+      // Standard cron: */step when starting at 0, otherwise start-max/step
+      if (vals[0] === 0) return `*/${step}`;
+      return `${vals[0]}-${mod - 1}/${step}`;
     }
   }
   return vals.join(',');
@@ -516,6 +540,21 @@ export function jobsToGitHubActionsYaml(jobs: CronJob[]): string {
   const valid = jobs.filter((j) => !j.error);
   const cronEntries = valid.map((j) => `      - cron: '${j.expression}'`).join('\n');
   const names = valid.map((j) => j.label).join(', ');
+  // Deduplicate YAML job keys
+  const usedKeys = new Set<string>();
+  const jobBlocks = valid.map((j) => {
+    let key = sanitizeYamlKey(j.label);
+    if (usedKeys.has(key)) {
+      let suffix = 2;
+      while (usedKeys.has(`${key}-${suffix}`)) suffix++;
+      key = `${key}-${suffix}`;
+    }
+    usedKeys.add(key);
+    return `  ${key}:
+    runs-on: ubuntu-latest
+    steps:
+      - run: ${j.command || 'echo "placeholder"'}`;
+  }).join('\n');
   return `name: Scheduled Jobs
 # Generated by CronsCollision — ${valid.length} job(s): ${names}
 on:
@@ -523,10 +562,7 @@ on:
 ${cronEntries}
 
 jobs:
-${valid.map((j) => `  ${sanitizeYamlKey(j.label)}:
-    runs-on: ubuntu-latest
-    steps:
-      - run: ${j.command || 'echo "placeholder"'}`).join('\n')}
+${jobBlocks}
 `;
 }
 
@@ -535,9 +571,9 @@ export function jobsToJsonReport(jobs: CronJob[], stats: CollisionStats): string
   const collisionWindows: { start: string; end: string; load: number }[] = [];
   let i = 0;
   while (i < 1440) {
-    if (stats.loadByMinute[i] >= 3) {
+    if (stats.loadByMinute[i] >= 2) {
       const start = i;
-      while (i < 1440 && stats.loadByMinute[i] >= 3) i++;
+      while (i < 1440 && stats.loadByMinute[i] >= 2) i++;
       collisionWindows.push({
         start: minuteToTime(start),
         end: minuteToTime(Math.min(i - 1, 1439)),
